@@ -59,6 +59,7 @@ _FAULT_SYMBOL_PATTERN = re.compile(
 )
 _DUMP_ID_PATTERN = re.compile(r"^crash-(\d{8}-\d{6})-(\d{3})$")
 _CHAIN_PATTERN = re.compile(r"(?:&&)|\||;")
+_DEREF_ASSIGN_PATTERN = re.compile(r"^\*(?P<ptr>[A-Za-z_]\w*)\s*=\s*(?P<rhs>.+);$")
 _TEXT_EXTENSIONS = {
     ".c",
     ".cc",
@@ -104,6 +105,7 @@ class SkillError(Exception):
 
 
 DEFAULT_SESSION_FILE = Path(__file__).resolve().parents[1] / ".dump-sessions.json"
+DEFAULT_REPORT_TEMPLATE_FILE = Path(__file__).resolve().parents[1] / "references" / "report-template.md"
 
 
 def _emit(payload: dict[str, Any]) -> int:
@@ -173,6 +175,39 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 def _write_json_file(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_report_template_path() -> Path:
+    env_path = os.getenv("DUMP_SKILL_REPORT_TEMPLATE_FILE")
+    if env_path:
+        return Path(env_path).resolve()
+    return DEFAULT_REPORT_TEMPLATE_FILE
+
+
+def _load_report_template_text() -> str:
+    path = _get_report_template_path()
+    if not path.exists() or not path.is_file():
+        raise SkillError(
+            "invalid_path",
+            "Report template file not found.",
+            {"template_file": str(path)},
+        )
+    return path.read_text(encoding="utf-8")
+
+
+def _apply_report_template(template: str, values: dict[str, str]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+
+    unresolved = sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", rendered)))
+    if unresolved:
+        raise SkillError(
+            "validation_error",
+            "Report template contains unresolved placeholders.",
+            {"placeholders": unresolved, "template_file": str(_get_report_template_path())},
+        )
+    return rendered.strip() + "\n"
 
 
 def _load_session_file(session_file: str) -> tuple[Path, dict[str, Any]]:
@@ -1043,8 +1078,21 @@ def _handle_not_implemented(command: str) -> dict[str, Any]:
 
 
 def _handle_analyze(args: argparse.Namespace) -> dict[str, Any]:
-    result = _analyze_by_dump_id(str(args.session_file), str(args.dump_id))
-    return _ok(**result)
+    session_file = str(args.session_file)
+    dump_id = str(args.dump_id)
+    result = _analyze_by_dump_id(session_file, dump_id)
+    session = _get_session(session_file, dump_id)
+    markdown = _render_markdown_report(
+        analyzed=result,
+        source_root=str(session["source_root"]),
+        thread_id=int(result["crashing_thread"]),
+        max_frames=30,
+    )
+    return _ok(
+        **result,
+        format="markdown",
+        report_markdown=markdown,
+    )
 
 
 def _handle_exception(args: argparse.Namespace) -> dict[str, Any]:
@@ -1079,6 +1127,356 @@ def _handle_modules(args: argparse.Namespace) -> dict[str, Any]:
         dump_id=analyzed["dump_id"],
         symbol_quality=analyzed["symbol_quality"],
         loaded_modules=analyzed["loaded_modules"],
+    )
+
+
+def _report_module_name(value: str) -> str:
+    if not value or value == "unknown":
+        return "-"
+    return Path(value).stem
+
+
+def _report_symbol_quality(analyzed: dict[str, Any]) -> str:
+    raw = str(analyzed.get("symbol_quality", "missing")).lower()
+    mapping = {
+        "good": "Good",
+        "partial": "Partial",
+        "poor": "Poor",
+        "missing": "Missing",
+    }
+    pretty = mapping.get(raw, raw.title() or "Unknown")
+    if raw != "good":
+        return pretty
+
+    fault_module = _report_module_name(str(analyzed.get("fault_module", "")))
+    if fault_module != "-":
+        return f"{pretty} ({fault_module}.pdb 로드 성공)"
+
+    loaded_modules = analyzed.get("loaded_modules") or []
+    if isinstance(loaded_modules, list):
+        for item in loaded_modules:
+            module = _report_module_name(str(item.get("module", "")))
+            if module != "-":
+                return f"{pretty} ({module}.pdb 로드 성공)"
+
+    return pretty
+
+
+def _report_stack_rows(analyzed: dict[str, Any], max_frames: int) -> list[str]:
+    rows: list[str] = []
+    frames = analyzed.get("stack_frames") or []
+    if not isinstance(frames, list):
+        return rows
+
+    fault_module = str(analyzed.get("fault_module", ""))
+    fault_function = str(analyzed.get("fault_function", ""))
+    for frame in frames[:max_frames]:
+        index = int(frame.get("index", len(rows)))
+        module = str(frame.get("module") or "")
+        function = str(frame.get("function") or "")
+
+        is_unknown = (not module or module == "unknown") and (not function or function == "unknown")
+        if is_unknown and index == 0:
+            rows.append("| 0 | - | *(크래시 발생 지점, 심볼 없음)* |")
+            continue
+
+        module_text = _report_module_name(module)
+        if function and function != "unknown":
+            function_text = f"`{function}`"
+        else:
+            function_text = "*(심볼 없음)*"
+
+        is_fault = (
+            module
+            and function
+            and module != "unknown"
+            and function != "unknown"
+            and module == fault_module
+            and function == fault_function
+        )
+        if is_fault:
+            module_text = f"**{module_text}**"
+            function_text = f"**{function_text}**"
+
+        rows.append(f"| {index} | {module_text} | {function_text} |")
+
+    if not rows:
+        rows.append("| 0 | - | *(스택 프레임 없음)* |")
+    return rows
+
+
+def _resolve_source_file_for_report(source_root: str, source_file: str) -> Path | None:
+    if not source_file or source_file == "unknown":
+        return None
+    root = Path(source_root).resolve()
+
+    try:
+        strict = _resolve_source_file(source_root, source_file)
+        if strict.exists() and strict.is_file():
+            return strict
+    except SkillError:
+        pass
+
+    raw = str(source_file).strip()
+    if not raw:
+        return None
+    normalized = raw.replace("\\", "/").strip()
+    without_drive = normalized.split(":", 1)[-1] if ":" in normalized[:3] else normalized
+    relative_hint = without_drive.lstrip("/\\")
+
+    if relative_hint:
+        hinted = (root / Path(relative_hint)).resolve()
+        if _is_inside_root(hinted, root) and hinted.exists() and hinted.is_file():
+            return hinted
+
+    filename = Path(relative_hint or normalized).name
+    if not filename:
+        return None
+
+    matches = sorted(
+        [p.resolve() for p in root.rglob(filename) if p.is_file()],
+        key=lambda p: (len(p.parts), str(p).lower()),
+    )
+    if not matches:
+        return None
+
+    hint_parts = [part.lower() for part in Path(relative_hint).parts if part not in {"", "."}]
+    if len(hint_parts) >= 2:
+        suffix_matches = []
+        for candidate in matches:
+            tail = [part.lower() for part in candidate.parts[-len(hint_parts) :]]
+            if tail == hint_parts:
+                suffix_matches.append(candidate)
+        if suffix_matches:
+            matches = suffix_matches
+
+    return matches[0]
+
+
+def _report_source_snippet(source_root: str, source_file: str, focus_line: int) -> tuple[str, str, str]:
+    if not source_file or source_file == "unknown" or focus_line <= 0:
+        return "", "", ""
+    target = _resolve_source_file_for_report(source_root, source_file)
+    if target is None:
+        return "", "", ""
+    if not target.exists() or not target.is_file():
+        return "", "", ""
+
+    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        return "", "", str(target)
+    if lines[0].startswith("\ufeff"):
+        lines[0] = lines[0].lstrip("\ufeff")
+
+    clamped = min(max(focus_line, 1), len(lines))
+    start = max(1, clamped - 3)
+    end = min(len(lines), clamped + 3)
+    selected = lines[start - 1 : end]
+    snippet = "\n".join(selected)
+    source_line = lines[clamped - 1].strip()
+    return snippet, source_line, str(target)
+
+
+def _report_problem_location(source_file: str, source_line_no: int) -> str:
+    if not source_file or source_file == "unknown" or source_line_no <= 0:
+        return "확인 불가 (심볼/소스 매핑 실패)"
+    path = Path(source_file)
+    return f"`{path.name}:{source_line_no}` (`{source_file}`)"
+
+
+def _report_extract_pointer_name(source_line: str) -> str:
+    if not source_line:
+        return "ptr"
+    m = re.search(r"\*(\w+)", source_line)
+    if m:
+        return m.group(1)
+    return "ptr"
+
+
+def _report_root_cause(analyzed: dict[str, Any], source_line: str, source_snippet: str) -> tuple[str, str]:
+    source_file = str(analyzed.get("source_location", {}).get("file", "unknown"))
+    source_name = Path(source_file).name if source_file and source_file != "unknown" else "알 수 없는 소스"
+    function = str(analyzed.get("fault_function", "unknown"))
+    function_name = function if function and function != "unknown" else "알 수 없는 함수"
+    line_text = source_line.strip()
+
+    if str(analyzed.get("exception_name", "")) == "EXCEPTION_ACCESS_VIOLATION":
+        lowered = line_text.lower()
+        snippet_lowered = source_snippet.lower()
+        if line_text and ("nullptr" in lowered or ("nullptr" in snippet_lowered and "*" in line_text)):
+            summary = (
+                f"{source_name}의 `{function_name}()` 함수에서 **NULL 포인터 역참조(Null Pointer Dereference)** 가 발생했습니다."
+            )
+            detail = (
+                f"**`{line_text}` 코드에서 `nullptr` 상태 포인터를 역참조**하면서 접근 위반(`0xC0000005`)이 발생했습니다."
+            )
+            return summary, detail
+
+        summary = f"{source_name}의 `{function_name}()` 함수에서 **잘못된 메모리 접근(Access Violation)** 이 발생했습니다."
+        detail = "포인터 또는 주소 유효성 검증 없이 메모리에 접근하여 OS가 실행을 중단했습니다."
+        return summary, detail
+
+    summary = f"`{function_name}` 실행 중 **{analyzed.get('exception_name', 'UNKNOWN_EXCEPTION')}** 예외가 발생했습니다."
+    detail = "예외 직전 프레임과 소스 라인을 기준으로 입력값/포인터/리소스 유효성을 점검해야 합니다."
+    return summary, detail
+
+
+def _report_fix_method(analyzed: dict[str, Any], source_line: str, source_snippet: str) -> str:
+    if str(analyzed.get("exception_name", "")) == "EXCEPTION_ACCESS_VIOLATION":
+        lowered = source_line.lower()
+        snippet_lowered = source_snippet.lower()
+        if source_line and ("nullptr" in lowered or ("nullptr" in snippet_lowered and "*" in source_line)):
+            ptr_name = _report_extract_pointer_name(source_line)
+            assign_match = _DEREF_ASSIGN_PATTERN.match(source_line.strip())
+            if assign_match:
+                ptr_name = assign_match.group("ptr")
+                rhs = assign_match.group("rhs").strip()
+                return (
+                    "문제 라인을 기준으로 포인터 유효성 검사를 먼저 수행하도록 수정합니다.\n\n"
+                    "```cpp\n"
+                    f"if ({ptr_name} != nullptr) {{\n"
+                    f"    *{ptr_name} = {rhs};\n"
+                    "}\n"
+                    "```"
+                )
+
+            return (
+                "포인터를 역참조하기 전 반드시 유효성을 검사해야 합니다.\n\n"
+                "```cpp\n"
+                f"// {source_line}\n"
+                f"    if ({ptr_name} != nullptr) {{\n"
+                f"        *{ptr_name} = 42;\n"
+                "    }\n"
+                "```"
+            )
+
+        return (
+            "접근 대상 주소가 유효한지 확인한 뒤에만 메모리에 접근해야 합니다.\n\n"
+            "```cpp\n"
+            "if (pointer != nullptr) {\n"
+            "    *pointer = value;\n"
+            "}\n"
+            "```"
+        )
+
+    return "예외 재현 경로에서 입력값/객체 수명/스레드 경쟁 상태를 순서대로 검증하세요."
+
+
+def _report_call_flow(analyzed: dict[str, Any], source_line: str) -> str:
+    frames = analyzed.get("stack_frames") or []
+    if not isinstance(frames, list) or not frames:
+        return "호출 흐름 정보를 수집하지 못했습니다."
+
+    selected = list(reversed(frames[: min(len(frames), 8)]))
+    lines: list[str] = []
+    for idx, frame in enumerate(selected):
+        function = str(frame.get("function") or "")
+        module = _report_module_name(str(frame.get("module") or ""))
+        if function and function != "unknown":
+            if module != "-":
+                entry = f"{module}!{function}"
+            else:
+                entry = function
+        else:
+            entry = "(심볼 없음)"
+
+        file = str(frame.get("file") or "")
+        line_no = int(frame.get("line") or 0)
+        if file and line_no > 0:
+            entry = f"{entry}  [{Path(file).name}:{line_no}]"
+
+        indent = "  " * idx
+        prefix = "" if idx == 0 else "└─ "
+        lines.append(f"{indent}{prefix}{entry}")
+
+    if source_line:
+        lines.append(f"{'  ' * len(selected)}└─ {source_line}  ← 예외 발생 지점")
+
+    return "\n".join(lines)
+
+
+def _render_markdown_report(
+    *,
+    analyzed: dict[str, Any],
+    source_root: str,
+    thread_id: int,
+    max_frames: int,
+) -> str:
+    source_file = str(analyzed.get("source_location", {}).get("file", "unknown"))
+    source_line_no = int(analyzed.get("source_location", {}).get("line", 0))
+    source_snippet, source_line, resolved_source_file = _report_source_snippet(
+        source_root, source_file, source_line_no
+    )
+    root_summary, root_detail = _report_root_cause(analyzed, source_line, source_snippet)
+
+    stack_rows = _report_stack_rows(analyzed, max_frames=max_frames)
+    call_flow = _report_call_flow(analyzed, source_line)
+    fix_method = _report_fix_method(analyzed, source_line, source_snippet)
+    problem_code_block = "- 문제 코드: 확인 불가"
+    if source_line:
+        problem_code_block = "\n".join(
+            [
+                "- 문제 코드:",
+                "```cpp",
+                source_line,
+                "```",
+            ]
+        )
+
+    context_code_block = ""
+    if source_snippet:
+        context_code_block = "\n".join(
+            [
+                "- 주변 코드:",
+                "```cpp",
+                source_snippet,
+                "```",
+            ]
+        )
+
+    template = _load_report_template_text()
+    return _apply_report_template(
+        template,
+        {
+            "THREAD_ID": str(thread_id),
+            "EXCEPTION_CODE": str(analyzed.get("exception_code", "unknown")),
+            "EXCEPTION_NAME": str(analyzed.get("exception_name", "UNKNOWN_EXCEPTION")),
+            "FAULT_ADDRESS": str(analyzed.get("fault_address", "unknown")),
+            "SYMBOL_QUALITY": _report_symbol_quality(analyzed),
+            "STACK_ROWS": "\n".join(stack_rows),
+            "ROOT_SUMMARY": root_summary,
+            "PROBLEM_LOCATION": _report_problem_location(
+                resolved_source_file if resolved_source_file else source_file,
+                source_line_no,
+            ),
+            "PROBLEM_CODE_BLOCK": problem_code_block,
+            "CONTEXT_CODE_BLOCK": context_code_block,
+            "ROOT_DETAIL": root_detail,
+            "CALL_FLOW": call_flow,
+            "FIX_METHOD": fix_method,
+        },
+    )
+
+
+def _handle_report(args: argparse.Namespace) -> dict[str, Any]:
+    max_frames = int(args.max_frames)
+    if max_frames <= 0:
+        raise SkillError("validation_error", "max_frames must be positive.", {"max_frames": max_frames})
+
+    analyzed = _analyze_by_dump_id(str(args.session_file), str(args.dump_id))
+    session = _get_session(str(args.session_file), str(args.dump_id))
+    thread_id = int(args.thread_id) if args.thread_id is not None else int(analyzed["crashing_thread"])
+
+    markdown = _render_markdown_report(
+        analyzed=analyzed,
+        source_root=str(session["source_root"]),
+        thread_id=thread_id,
+        max_frames=max_frames,
+    )
+    return _ok(
+        dump_id=analyzed["dump_id"],
+        format="markdown",
+        report_markdown=markdown,
     )
 
 
@@ -1291,6 +1689,15 @@ def _build_parser() -> argparse.ArgumentParser:
     modules = sub.add_parser("modules", help="Get module list and symbol quality for dump_id.")
     modules.add_argument("--dump-id", required=True)
     modules.set_defaults(handler=_handle_modules)
+
+    report = sub.add_parser(
+        "report",
+        help="Render Korean markdown crash report for dump_id.",
+    )
+    report.add_argument("--dump-id", required=True)
+    report.add_argument("--thread-id", type=int)
+    report.add_argument("--max-frames", default=30, type=int)
+    report.set_defaults(handler=_handle_report)
 
     source_context = sub.add_parser(
         "source-context",

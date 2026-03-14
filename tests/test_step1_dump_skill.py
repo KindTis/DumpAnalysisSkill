@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -132,6 +132,8 @@ def test_analyze_returns_structured_result_from_fake_output(tmp_path: Path) -> N
     assert analyzed["crashing_thread"] == 42
     assert len(analyzed["stack_frames"]) == 2
     assert analyzed["symbol_quality"] == "good"
+    assert analyzed["format"] == "markdown"
+    assert "## 크래시 덤프 분석 결과" in analyzed["report_markdown"]
 
 
 def test_exception_stack_modules_commands_return_expected_payloads(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-﻿# Command Recipes
+# Command Recipes
 
 ## 1) Register and Analyze
 
@@ -17,6 +17,16 @@ python scripts/dump_skill.py analyze --dump-id crash-20260315-120000-001
 python scripts/dump_skill.py exception --dump-id crash-20260315-120000-001
 python scripts/dump_skill.py stack --dump-id crash-20260315-120000-001 --max-frames 20
 python scripts/dump_skill.py modules --dump-id crash-20260315-120000-001
+python scripts/dump_skill.py report --dump-id crash-20260315-120000-001 --max-frames 30
+```
+
+`analyze` result already contains `report_markdown` for default final report rendering.
+
+Custom template:
+
+```bash
+set DUMP_SKILL_REPORT_TEMPLATE_FILE=C:\work\templates\my-report.md
+python scripts/dump_skill.py report --dump-id crash-20260315-120000-001
 ```
 
 ## 2) Source Context and Search
