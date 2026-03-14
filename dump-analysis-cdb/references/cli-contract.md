@@ -31,13 +31,16 @@
   - `exception --dump-id`
   - `stack --dump-id [--max-frames] [--thread-id]`
   - `modules --dump-id`
-- Planned for next steps:
-  - `source-context`
-  - `search`
-  - `patch`
-  - `build`
-  - `test`
+- Implemented in Step 2:
+  - `source-context --dump-id [--frame-index] [--context-before] [--context-after]`
+  - `search --query [--dump-id|--source-root] [--max-results] [--ignore-case]`
+- Implemented in Step 3:
+  - `patch --dump-id|--source-root --mode preview|apply [--user-confirmed] --changes-json|--changes-file`
+  - `build --command [--dump-id] [--working-directory] [--timeout-seconds] --user-confirmed`
+  - `test --command [--dump-id] [--working-directory] [--timeout-seconds] --user-confirmed`
 
 ## Step Status
 - Step 0: command names and JSON contract defined.
 - Step 1: register/analyze/exception/stack/modules implemented.
+- Step 2: source-context/search implemented.
+- Step 3: patch/build/test guard logic implemented.

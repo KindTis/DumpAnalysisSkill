@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from difflib import unified_diff
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -56,6 +58,41 @@ _FAULT_SYMBOL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DUMP_ID_PATTERN = re.compile(r"^crash-(\d{8}-\d{6})-(\d{3})$")
+_CHAIN_PATTERN = re.compile(r"(?:&&)|\||;")
+_TEXT_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".inl",
+    ".ixx",
+    ".cs",
+    ".py",
+    ".txt",
+    ".ini",
+    ".json",
+    ".uplugin",
+    ".uproject",
+}
+_DEFAULT_BUILD_ALLOWLIST = (
+    "msbuild",
+    "dotnet",
+    "cmake",
+    "ninja",
+    "UnrealBuildTool",
+    "RunUAT",
+)
+_DEFAULT_TEST_ALLOWLIST = (
+    "ctest",
+    "dotnet",
+    "pytest",
+    "UnrealEditor-Cmd",
+    "RunUAT",
+)
 
 
 class SkillError(Exception):
@@ -163,6 +200,412 @@ def _get_session(session_file: str, dump_id: str) -> dict[str, Any]:
         if item.get("dump_id") == dump_id:
             return item
     raise SkillError("invalid_request", f"dump_id '{dump_id}' does not exist.", {"dump_id": dump_id})
+
+
+def _is_inside_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_source_file(source_root: str, source_file: str) -> Path:
+    root = Path(source_root).resolve()
+    file_candidate = Path(source_file)
+    target = file_candidate if file_candidate.is_absolute() else (root / file_candidate)
+    target = target.resolve()
+    if not _is_inside_root(target, root):
+        raise SkillError(
+            "invalid_path",
+            "Resolved source file is outside source_root.",
+            {"source_root": str(root), "source_file": str(target)},
+        )
+    return target
+
+
+def _get_source_context_payload(
+    *,
+    source_root: str,
+    source_file: str,
+    focus_line: int,
+    context_before: int,
+    context_after: int,
+) -> dict[str, Any]:
+    if context_before < 0 or context_after < 0:
+        raise SkillError("invalid_request", "context_before/context_after must be >= 0.")
+    if focus_line <= 0:
+        raise SkillError(
+            "source_mapping_failed",
+            "Source line is not available for requested frame.",
+            {"focus_line": focus_line},
+        )
+
+    target = _resolve_source_file(source_root, source_file)
+    if not target.exists() or not target.is_file():
+        raise SkillError(
+            "source_mapping_failed",
+            "Resolved source file does not exist.",
+            {"source_file": str(target)},
+        )
+
+    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        return {
+            "file": str(target),
+            "start_line": 1,
+            "end_line": 0,
+            "focus_line": focus_line,
+            "lines": [],
+        }
+
+    clamped_focus = min(max(focus_line, 1), len(lines))
+    start_line = max(1, clamped_focus - context_before)
+    end_line = min(len(lines), clamped_focus + context_after)
+    selected = [{"line": idx + 1, "text": lines[idx]} for idx in range(start_line - 1, end_line)]
+    return {
+        "file": str(target),
+        "start_line": start_line,
+        "end_line": end_line,
+        "focus_line": clamped_focus,
+        "lines": selected,
+    }
+
+
+def _search_code_references_payload(
+    *,
+    source_root: str,
+    query: str,
+    max_results: int,
+    ignore_case: bool,
+) -> list[dict[str, Any]]:
+    if not query.strip():
+        raise SkillError("invalid_request", "query must be non-empty.")
+    if max_results <= 0:
+        raise SkillError("invalid_request", "max_results must be positive.")
+
+    root = Path(source_root).resolve()
+    if not root.exists() or not root.is_dir():
+        raise SkillError(
+            "source_root_invalid",
+            "source_root does not exist.",
+            {"source_root": str(root)},
+        )
+
+    needle = query.lower() if ignore_case else query
+    results: list[dict[str, Any]] = []
+    for path in root.rglob("*"):
+        if len(results) >= max_results:
+            break
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in _TEXT_EXTENSIONS:
+            continue
+        if not _is_inside_root(path, root):
+            continue
+
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+
+        for idx, line in enumerate(content, start=1):
+            hay = line.lower() if ignore_case else line
+            if needle in hay:
+                results.append(
+                    {
+                        "file": str(path.resolve()),
+                        "line": idx,
+                        "match": line.strip(),
+                    }
+                )
+                if len(results) >= max_results:
+                    break
+    return results
+
+
+def _parse_csv(value: str | None, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    if not value:
+        return fallback
+    items = [item.strip() for item in value.split(",")]
+    return tuple(item for item in items if item)
+
+
+def _get_build_allowlist() -> tuple[str, ...]:
+    return _parse_csv(
+        os.getenv("DUMP_SKILL_BUILD_ALLOWLIST") or os.getenv("DUMP_MCP_BUILD_ALLOWLIST"),
+        _DEFAULT_BUILD_ALLOWLIST,
+    )
+
+
+def _get_test_allowlist() -> tuple[str, ...]:
+    return _parse_csv(
+        os.getenv("DUMP_SKILL_TEST_ALLOWLIST") or os.getenv("DUMP_MCP_TEST_ALLOWLIST"),
+        _DEFAULT_TEST_ALLOWLIST,
+    )
+
+
+def _get_max_output_chars() -> int:
+    value = os.getenv("DUMP_SKILL_MAX_OUTPUT_CHARS") or os.getenv("DUMP_MCP_MAX_OUTPUT_CHARS") or "200000"
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise SkillError("validation_error", "max_output_chars must be an integer.", {"value": value}) from exc
+    if parsed <= 0:
+        raise SkillError("validation_error", "max_output_chars must be positive.", {"value": parsed})
+    return parsed
+
+
+def _get_default_timeout(tool: str) -> int:
+    if tool == "build":
+        raw = os.getenv("DUMP_SKILL_BUILD_TIMEOUT_SECONDS") or os.getenv("DUMP_MCP_BUILD_TIMEOUT_SECONDS") or "1200"
+    else:
+        raw = os.getenv("DUMP_SKILL_TEST_TIMEOUT_SECONDS") or os.getenv("DUMP_MCP_TEST_TIMEOUT_SECONDS") or "1800"
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise SkillError("validation_error", f"{tool} timeout must be an integer.", {"value": raw}) from exc
+    if parsed <= 0:
+        raise SkillError("validation_error", f"{tool} timeout must be positive.", {"value": parsed})
+    return parsed
+
+
+def _contains_shell_chaining(command: str) -> bool:
+    return bool(_CHAIN_PATTERN.search(command))
+
+
+def _normalize_command_name(executable: str) -> str:
+    raw = executable.strip().strip('"').strip("'")
+    base = Path(raw).name if ("\\" in raw or "/" in raw) else raw
+    return os.path.splitext(base)[0].lower()
+
+
+def _validate_command(command: str, allowlist: tuple[str, ...]) -> str:
+    if _contains_shell_chaining(command):
+        raise SkillError(
+            "policy_violation",
+            "Shell chaining operators are not allowed.",
+            {"command": command},
+        )
+    if not command.strip():
+        raise SkillError("invalid_request", "command must be non-empty.")
+
+    parts = shlex.split(command, posix=False)
+    if not parts:
+        raise SkillError("invalid_request", "Command is empty after parsing.")
+
+    normalized = _normalize_command_name(parts[0])
+    allowed = {item.lower() for item in allowlist}
+    if normalized not in allowed:
+        raise SkillError(
+            "policy_violation",
+            "Command is not allowed by policy.",
+            {
+                "command": command,
+                "normalized_executable": normalized,
+                "allowlist": sorted(allowed),
+            },
+        )
+    return normalized
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n...[truncated {len(text) - max_chars} chars]"
+
+
+def _run_command(args: list[str], cwd: str | None, timeout_seconds: int) -> tuple[int, str, str]:
+    if os.getenv("DUMP_SKILL_FAKE_COMMAND_TIMEOUT") == "1":
+        raise TimeoutError("timed out")
+
+    fake = os.getenv("DUMP_SKILL_FAKE_COMMAND_RESULT")
+    if fake:
+        try:
+            parsed = json.loads(fake)
+        except json.JSONDecodeError as exc:
+            raise SkillError(
+                "validation_error",
+                "DUMP_SKILL_FAKE_COMMAND_RESULT must be valid JSON.",
+                {"message": str(exc)},
+            ) from exc
+        return_code = int(parsed.get("return_code", 0))
+        stdout = str(parsed.get("stdout", ""))
+        stderr = str(parsed.get("stderr", ""))
+        return return_code, stdout, stderr
+
+    completed = subprocess.run(
+        args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def _resolve_working_directory(
+    *,
+    session_file: str,
+    dump_id: str | None,
+    working_directory: str | None,
+) -> str | None:
+    if working_directory:
+        wd = Path(_require_absolute(working_directory, "working_directory"))
+        if not wd.exists() or not wd.is_dir():
+            raise SkillError(
+                "invalid_path",
+                "working_directory does not exist.",
+                {"working_directory": str(wd)},
+            )
+        return str(wd)
+
+    if dump_id:
+        source_root = str(_get_session(session_file, dump_id)["source_root"])
+        wd = Path(source_root)
+        if not wd.exists() or not wd.is_dir():
+            raise SkillError(
+                "invalid_path",
+                "source_root from dump_id does not exist.",
+                {"dump_id": dump_id, "source_root": source_root},
+            )
+        return source_root
+
+    return None
+
+
+def _run_guarded_command(
+    *,
+    tool_name: str,
+    error_code: str,
+    command: str,
+    user_confirmed: bool,
+    allowlist: tuple[str, ...],
+    timeout_seconds: int | None,
+    default_timeout: int,
+    working_directory: str | None,
+) -> dict[str, Any]:
+    if not user_confirmed:
+        raise SkillError(
+            "policy_violation",
+            f"{tool_name} requires explicit user confirmation.",
+            {"required_flag": "user_confirmed"},
+        )
+
+    normalized = _validate_command(command, allowlist)
+    args = shlex.split(command, posix=False)
+    if not args:
+        raise SkillError("invalid_request", "Command cannot be empty after parsing.")
+
+    timeout = timeout_seconds if timeout_seconds is not None else default_timeout
+    if timeout <= 0:
+        raise SkillError("invalid_request", "timeout_seconds must be positive.", {"timeout_seconds": timeout})
+
+    try:
+        return_code, stdout, stderr = _run_command(args=args, cwd=working_directory, timeout_seconds=timeout)
+    except TimeoutError as exc:
+        raise SkillError(
+            error_code,
+            f"{tool_name} timed out.",
+            {"command": command, "timeout_seconds": timeout, "timed_out": True},
+        ) from exc
+    except SkillError:
+        raise
+    except Exception as exc:
+        raise SkillError(
+            error_code,
+            f"{tool_name} execution failed.",
+            {"command": command, "exception": type(exc).__name__, "message": str(exc)},
+        ) from exc
+
+    max_output_chars = _get_max_output_chars()
+    trimmed_stdout = _truncate(stdout, max_output_chars)
+    trimmed_stderr = _truncate(stderr, max_output_chars)
+    if return_code != 0:
+        raise SkillError(
+            error_code,
+            f"{tool_name} command failed.",
+            {
+                "command": command,
+                "exit_code": return_code,
+                "stdout": trimmed_stdout,
+                "stderr": trimmed_stderr,
+                "normalized_executable": normalized,
+            },
+        )
+
+    return _ok(
+        tool=tool_name,
+        status="passed",
+        command=command,
+        normalized_executable=normalized,
+        exit_code=return_code,
+        stdout=trimmed_stdout,
+        stderr=trimmed_stderr,
+        timeout_seconds=timeout,
+    )
+
+
+def _resolve_patch_source_root(args: argparse.Namespace) -> str:
+    if args.source_root:
+        return _require_existing_dir(str(args.source_root), "source_root_invalid", "source_root")
+    if args.dump_id:
+        source_root = str(_get_session(str(args.session_file), str(args.dump_id))["source_root"])
+        return _require_existing_dir(source_root, "source_root_invalid", "source_root")
+    raise SkillError("invalid_request", "patch requires either 'source_root' or 'dump_id'.")
+
+
+def _resolve_patch_target(root: Path, raw_path: str) -> Path:
+    candidate = Path(raw_path)
+    target = candidate if candidate.is_absolute() else (root / candidate)
+    resolved = target.resolve()
+    if not _is_inside_root(resolved, root):
+        raise SkillError(
+            "invalid_path",
+            "Patch target path is outside source_root.",
+            {"source_root": str(root), "target": str(resolved)},
+        )
+    return resolved
+
+
+def _load_patch_changes(args: argparse.Namespace) -> list[dict[str, str]]:
+    has_json = bool(args.changes_json)
+    has_file = bool(args.changes_file)
+    if has_json == has_file:
+        raise SkillError(
+            "invalid_request",
+            "Provide exactly one of --changes-json or --changes-file.",
+        )
+
+    if has_json:
+        raw = str(args.changes_json)
+    else:
+        path = Path(str(args.changes_file))
+        if not path.exists() or not path.is_file():
+            raise SkillError("invalid_path", "changes_file not found.", {"path": str(path)})
+        raw = path.read_text(encoding="utf-8")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SkillError("invalid_request", "changes JSON is invalid.", {"message": str(exc)}) from exc
+
+    if not isinstance(parsed, list) or not parsed:
+        raise SkillError("invalid_request", "changes must be a non-empty list.")
+
+    result: list[dict[str, str]] = []
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise SkillError("invalid_request", "Each change must be an object.", {"index": idx})
+        path = item.get("path")
+        content = item.get("content")
+        if not isinstance(path, str) or not path.strip():
+            raise SkillError("invalid_request", "Change 'path' must be non-empty string.", {"index": idx})
+        if not isinstance(content, str):
+            raise SkillError("invalid_request", "Change 'content' must be string.", {"index": idx})
+        result.append({"path": path, "content": content})
+    return result
 
 
 def _exception_name_from_text(text: str) -> str:
@@ -639,6 +1082,177 @@ def _handle_modules(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _handle_source_context(args: argparse.Namespace) -> dict[str, Any]:
+    frame_index = int(args.frame_index)
+    context_before = int(args.context_before)
+    context_after = int(args.context_after)
+    if frame_index < 0:
+        raise SkillError("invalid_request", "frame_index must be >= 0.", {"frame_index": frame_index})
+
+    session = _get_session(str(args.session_file), str(args.dump_id))
+    analyzed = _analyze_by_dump_id(str(args.session_file), str(args.dump_id))
+    frames = analyzed["stack_frames"]
+    if frame_index >= len(frames):
+        raise SkillError(
+            "invalid_request",
+            "frame_index is out of range.",
+            {"frame_index": frame_index, "stack_size": len(frames)},
+        )
+
+    frame = frames[frame_index]
+    source_file = str(frame.get("file") or analyzed["source_location"]["file"])
+    source_line = int(frame.get("line") or analyzed["source_location"]["line"] or 0)
+    if not source_file or source_file == "unknown":
+        raise SkillError(
+            "source_mapping_failed",
+            "No source file is mapped to requested frame.",
+            {"dump_id": analyzed["dump_id"], "frame_index": frame_index},
+        )
+
+    payload = _get_source_context_payload(
+        source_root=str(session["source_root"]),
+        source_file=source_file,
+        focus_line=source_line,
+        context_before=context_before,
+        context_after=context_after,
+    )
+    return _ok(dump_id=analyzed["dump_id"], frame_index=frame_index, **payload)
+
+
+def _handle_search(args: argparse.Namespace) -> dict[str, Any]:
+    query = str(args.query)
+    max_results = int(args.max_results)
+    ignore_case = bool(args.ignore_case)
+    dump_id: str | None = str(args.dump_id) if args.dump_id else None
+
+    if args.source_root:
+        source_root = _require_existing_dir(str(args.source_root), "source_root_invalid", "source_root")
+    elif dump_id:
+        source_root = str(_get_session(str(args.session_file), dump_id)["source_root"])
+    else:
+        raise SkillError(
+            "invalid_request",
+            "search requires either 'source_root' or 'dump_id'.",
+        )
+
+    results = _search_code_references_payload(
+        source_root=source_root,
+        query=query,
+        max_results=max_results,
+        ignore_case=ignore_case,
+    )
+    return _ok(
+        dump_id=dump_id,
+        source_root=source_root,
+        query=query,
+        count=len(results),
+        results=results,
+    )
+
+
+def _handle_patch(args: argparse.Namespace) -> dict[str, Any]:
+    mode = str(args.mode).lower()
+    if mode not in {"preview", "apply"}:
+        raise SkillError("invalid_request", "mode must be either 'preview' or 'apply'.", {"mode": mode})
+    if mode == "apply" and not bool(args.user_confirmed):
+        raise SkillError(
+            "policy_violation",
+            "apply mode requires explicit user confirmation.",
+            {"required_flag": "user_confirmed"},
+        )
+
+    source_root = _resolve_patch_source_root(args)
+    root = Path(source_root).resolve()
+    changes = _load_patch_changes(args)
+
+    prepared: list[tuple[Path, str, str]] = []
+    for change in changes:
+        target = _resolve_patch_target(root, change["path"])
+        old_text = ""
+        if target.exists():
+            if not target.is_file():
+                raise SkillError("invalid_path", "Patch target must be a file path.", {"target": str(target)})
+            old_text = target.read_text(encoding="utf-8", errors="replace")
+        prepared.append((target, old_text, change["content"]))
+
+    diff_chunks: list[str] = []
+    modified_files: list[str] = []
+    for target, old_text, new_text in prepared:
+        if old_text == new_text:
+            continue
+        modified_files.append(str(target))
+        from_name = f"a/{target.name}" if old_text else "/dev/null"
+        to_name = f"b/{target.name}"
+        diff_chunks.extend(
+            unified_diff(
+                old_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=from_name,
+                tofile=to_name,
+            )
+        )
+
+    if mode == "apply":
+        for target, _old_text, new_text in prepared:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new_text, encoding="utf-8")
+
+    return _ok(
+        mode=mode,
+        applied=(mode == "apply"),
+        modified_files=modified_files,
+        diff="".join(diff_chunks),
+    )
+
+
+def _handle_build(args: argparse.Namespace) -> dict[str, Any]:
+    command = str(args.command)
+    timeout_seconds = int(args.timeout_seconds) if args.timeout_seconds is not None else None
+    dump_id = str(args.dump_id) if args.dump_id else None
+    working_directory = (
+        str(args.working_directory) if args.working_directory else None
+    )
+    resolved_wd = _resolve_working_directory(
+        session_file=str(args.session_file),
+        dump_id=dump_id,
+        working_directory=working_directory,
+    )
+    return _run_guarded_command(
+        tool_name="build_project",
+        error_code="build_failed",
+        command=command,
+        user_confirmed=bool(args.user_confirmed),
+        allowlist=_get_build_allowlist(),
+        timeout_seconds=timeout_seconds,
+        default_timeout=_get_default_timeout("build"),
+        working_directory=resolved_wd,
+    )
+
+
+def _handle_test(args: argparse.Namespace) -> dict[str, Any]:
+    command = str(args.command)
+    timeout_seconds = int(args.timeout_seconds) if args.timeout_seconds is not None else None
+    dump_id = str(args.dump_id) if args.dump_id else None
+    working_directory = (
+        str(args.working_directory) if args.working_directory else None
+    )
+    resolved_wd = _resolve_working_directory(
+        session_file=str(args.session_file),
+        dump_id=dump_id,
+        working_directory=working_directory,
+    )
+    return _run_guarded_command(
+        tool_name="run_tests",
+        error_code="test_failed",
+        command=command,
+        user_confirmed=bool(args.user_confirmed),
+        allowlist=_get_test_allowlist(),
+        timeout_seconds=timeout_seconds,
+        default_timeout=_get_default_timeout("test"),
+        working_directory=resolved_wd,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="DumpAnalysisSkill CLI (without MCP). Outputs exactly one JSON object.",
@@ -678,15 +1292,60 @@ def _build_parser() -> argparse.ArgumentParser:
     modules.add_argument("--dump-id", required=True)
     modules.set_defaults(handler=_handle_modules)
 
-    for name in (
+    source_context = sub.add_parser(
         "source-context",
+        help="Get source context around a stack frame for dump_id.",
+    )
+    source_context.add_argument("--dump-id", required=True)
+    source_context.add_argument("--frame-index", default=0, type=int)
+    source_context.add_argument("--context-before", default=20, type=int)
+    source_context.add_argument("--context-after", default=20, type=int)
+    source_context.set_defaults(handler=_handle_source_context)
+
+    search = sub.add_parser(
         "search",
+        help="Search code references from source_root or dump session.",
+    )
+    search.add_argument("--query", required=True)
+    search.add_argument("--dump-id")
+    search.add_argument("--source-root")
+    search.add_argument("--max-results", default=50, type=int)
+    search.add_argument("--ignore-case", action="store_true")
+    search.set_defaults(handler=_handle_search)
+
+    patch = sub.add_parser(
         "patch",
+        help="Preview or apply file content changes with explicit confirmation for apply mode.",
+    )
+    patch.add_argument("--dump-id")
+    patch.add_argument("--source-root")
+    patch.add_argument("--mode", default="preview", choices=["preview", "apply"])
+    patch.add_argument("--user-confirmed", action="store_true")
+    patch.add_argument("--changes-json")
+    patch.add_argument("--changes-file")
+    patch.set_defaults(handler=_handle_patch)
+
+    build = sub.add_parser(
         "build",
+        help="Run a guarded build command (allowlist/timeout/confirmation).",
+    )
+    build.add_argument("--command", required=True)
+    build.add_argument("--dump-id")
+    build.add_argument("--working-directory")
+    build.add_argument("--timeout-seconds", type=int)
+    build.add_argument("--user-confirmed", action="store_true")
+    build.set_defaults(handler=_handle_build)
+
+    test = sub.add_parser(
         "test",
-    ):
-        cmd = sub.add_parser(name, help=f"{name} command")
-        cmd.set_defaults(handler=lambda _args, n=name: _handle_not_implemented(n))
+        help="Run a guarded test command (allowlist/timeout/confirmation).",
+    )
+    test.add_argument("--command", required=True)
+    test.add_argument("--dump-id")
+    test.add_argument("--working-directory")
+    test.add_argument("--timeout-seconds", type=int)
+    test.add_argument("--user-confirmed", action="store_true")
+    test.set_defaults(handler=_handle_test)
 
     return parser
 
