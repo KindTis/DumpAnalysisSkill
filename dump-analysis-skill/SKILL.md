@@ -1,9 +1,9 @@
----
-name: dump-analysis-cdb
+﻿---
+name: dump-analysis-skill
 description: Analyze Windows crash dumps (`.dmp`) directly from Python scripts using WinDbg `cdb.exe` without MCP server dependency. Use when Codex must run local dump triage, extract exception/stack/module/source context, search source references, and optionally run guarded patch/build/test flows with explicit confirmation and command policy controls.
 ---
 
-# Dump Analysis Cdb
+# Dump Analysis Skill
 
 ## Overview
 
@@ -84,3 +84,4 @@ Load references only when needed.
 - Need environment/debug recovery steps: read `references/troubleshooting.md`.
 
 Do not start MCP server for this workflow.
+

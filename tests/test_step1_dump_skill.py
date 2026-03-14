@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
-    / "dump-analysis-cdb"
+    / "dump-analysis-skill"
     / "scripts"
     / "dump_skill.py"
 )
@@ -229,3 +229,4 @@ def test_register_rejects_missing_dump_file(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert result["error"]["code"] == "dump_file_not_found"
+

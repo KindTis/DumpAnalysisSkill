@@ -1,4 +1,4 @@
-# Command Recipes
+﻿# Command Recipes
 
 ## 1) Register and Analyze
 
@@ -89,10 +89,11 @@ python scripts/dump_skill.py test \
 ## 5) Session Store
 
 Default session file:
-- `dump-analysis-cdb/.dump-sessions.json`
+- `dump-analysis-skill/.dump-sessions.json`
 
 Override:
 
 ```bash
 python scripts/dump_skill.py --session-file "C:\work\sessions.json" analyze --dump-id <id>
 ```
+

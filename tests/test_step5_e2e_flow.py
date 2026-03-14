@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
-    / "dump-analysis-cdb"
+    / "dump-analysis-skill"
     / "scripts"
     / "dump_skill.py"
 )
@@ -191,3 +191,4 @@ SYMBOL_STATUS: good
     )
     assert test["ok"] is True
     assert test["tool"] == "run_tests"
+

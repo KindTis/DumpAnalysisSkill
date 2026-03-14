@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
-    / "dump-analysis-cdb"
+    / "dump-analysis-skill"
     / "scripts"
     / "dump_skill.py"
 )
@@ -216,3 +216,4 @@ def test_test_command_returns_timeout_error(tmp_path: Path) -> None:
     )
     assert result["ok"] is False
     assert result["error"]["code"] == "test_failed"
+

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -11,7 +11,7 @@ import pytest
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
-    / "dump-analysis-cdb"
+    / "dump-analysis-skill"
     / "scripts"
     / "dump_skill.py"
 )
@@ -93,3 +93,4 @@ def test_real_dump_smoke_register_and_analyze(tmp_path: Path) -> None:
     assert analyzed["fault_module"] != "unknown"
     assert analyzed["fault_function"] != "unknown"
     assert int(analyzed["source_location"]["line"]) > 0
+
