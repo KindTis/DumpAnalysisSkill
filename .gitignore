@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# AI Agent docs
+AGENTS.md
+*_Plan.md
+*_Context.md
+*_CheckList.md
