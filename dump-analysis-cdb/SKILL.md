@@ -10,38 +10,52 @@ description: Analyze Windows crash dumps (`.dmp`) directly from Python scripts u
 Use this skill to analyze Windows dump files without running an MCP server.
 Execute the bundled CLI script, parse structured JSON output, and drive fix loops from the analysis result.
 
+## Quick Start
+
+Run from the skill folder:
+
+```bash
+python scripts/dump_skill.py register --dump-path <abs.dmp> --symbol-root <abs.symbols> --source-root <abs.source> --project-type native_cpp
+python scripts/dump_skill.py analyze --dump-id <dump_id>
+python scripts/dump_skill.py source-context --dump-id <dump_id> --frame-index 0
+```
+
+Use the JSON result as the only machine-readable interface.
+
 ## Workflow
 
-1. Validate prerequisites before analysis.
-- Confirm Windows environment and `cdb.exe` availability.
-- Prefer absolute paths for `dump_path`, `symbol_root`, and `source_root`.
+1. Validate prerequisites.
+- Confirm Windows and `cdb.exe` availability.
+- Use absolute paths for input files/directories.
 
 2. Register dump session.
-- Run `python scripts/dump_skill.py register ...`.
-- Capture `dump_id` from JSON response.
+- Run `register`.
+- Capture `dump_id`.
 
-3. Run crash analysis.
-- Run `python scripts/dump_skill.py analyze --dump-id <id>`.
-- Use `exception`, `stack`, `modules`, `source-context`, `search` for focused queries.
+3. Analyze and inspect.
+- Run `analyze`.
+- Narrow scope with `exception`, `stack`, `modules`.
+- Read code around crash frames with `source-context`.
+- Search related references with `search`.
 
-4. Apply optional remediation commands only with explicit confirmation.
-- Use `patch --mode apply --user-confirmed`.
-- Use `build --user-confirmed` and `test --user-confirmed`.
-- Reject commands that violate policy (non-allowlisted executable, shell chaining).
+4. Apply optional remediation.
+- Use `patch --mode preview` first.
+- Use `patch --mode apply --user-confirmed` for actual write.
+- Use `build`/`test` only with `--user-confirmed`.
 
-5. Interpret results from one JSON object per execution.
-- Success shape: `{ "ok": true, ... }`
-- Error shape: `{ "ok": false, "error": { "code", "message", "details" } }`
+5. Iterate.
+- Re-run `analyze` after modifications.
+- Keep command outputs as evidence for tests and review.
 
-## Script Usage
+## Commands
 
-Use the bundled script:
+Use entrypoint:
 
 ```bash
 python scripts/dump_skill.py <command> [options]
 ```
 
-Supported commands:
+Implemented commands:
 - `register`
 - `analyze`
 - `exception`
@@ -58,9 +72,15 @@ Supported commands:
 - Script entrypoint: `scripts/dump_skill.py`
 - CLI/output contract: `references/cli-contract.md`
 - Policy and safety rules: `references/safety-policy.md`
+- Command examples: `references/command-recipes.md`
+- Error code index: `references/error-codes.md`
+- Troubleshooting guide: `references/troubleshooting.md`
 
 Load references only when needed.
 - Need exact JSON fields or command argument names: read `references/cli-contract.md`.
 - Need guard behavior for patch/build/test: read `references/safety-policy.md`.
+- Need copy-paste command examples: read `references/command-recipes.md`.
+- Need error triage mapping: read `references/error-codes.md`.
+- Need environment/debug recovery steps: read `references/troubleshooting.md`.
 
 Do not start MCP server for this workflow.
